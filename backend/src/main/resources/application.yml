@@ -1,0 +1,37 @@
+spring:
+  application:
+    name: safe-retry-backend
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/safe_retry}
+    username: ${DB_USER:safe_retry}
+    password: ${DB_PASSWORD:safe_retry}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+  flyway:
+    locations: classpath:db/migration
+
+server:
+  shutdown: graceful
+
+management:
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never
+      group:
+        readiness:
+          include: readinessState,db
+  endpoints:
+    web:
+      exposure:
+        include: health
+
+assignment:
+  auth:
+    # Deliberately fake local-assignment credentials; production systems use an identity provider.
+    tokens:
+      tenant-alpha-token: tenant-alpha
+      tenant-beta-token: tenant-beta

@@ -1,0 +1,17 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:candidate-safe-retry;MODE=PostgreSQL;DB_CLOSE_DELAY=-1;DATABASE_TO_LOWER=TRUE
+    username: sa
+    password:
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+  flyway:
+    locations: classpath:db/migration
+
+assignment:
+  auth:
+    tokens:
+      tenant-alpha-token: tenant-alpha
+      tenant-beta-token: tenant-beta
