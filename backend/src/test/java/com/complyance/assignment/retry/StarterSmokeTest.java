@@ -62,20 +62,21 @@ class StarterSmokeTest {
     }
 
     @Test
-    void unfinishedRetryEndpointReturnsStableNotImplementedWithoutWriting() throws Exception {
+    void retryEndpointAcceptsARetryableTaskWithoutLeavingTheStarterUnimplemented() throws Exception {
         mockMvc.perform(post("/api/workflows/workflow-alpha/tasks/task-alpha-retryable/retry")
                         .header("Authorization", ALPHA_AUTH)
                         .header("Idempotency-Key", "starter-smoke-key")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"expectedVersion\":0}"))
-                .andExpect(status().isNotImplemented())
-                .andExpect(jsonPath("$.code").value("NOT_IMPLEMENTED"));
+                .andExpect(status().isAccepted())
+                .andExpect(jsonPath("$.code").doesNotExist())
+                .andExpect(jsonPath("$.status").value("RETRY_QUEUED"));
 
         assertThat(jdbc.queryForObject("select status from tasks where id = 'task-alpha-retryable'", String.class))
-                .isEqualTo("FAILED_RETRYABLE");
-        assertThat(jdbc.queryForObject("select count(*) from retry_attempts", Long.class)).isZero();
-        assertThat(jdbc.queryForObject("select count(*) from audit_events", Long.class)).isZero();
-        assertThat(jdbc.queryForObject("select count(*) from outbox_messages", Long.class)).isZero();
+                .isEqualTo("RETRY_QUEUED");
+        assertThat(jdbc.queryForObject("select count(*) from retry_attempts", Long.class)).isEqualTo(1);
+        assertThat(jdbc.queryForObject("select count(*) from audit_events", Long.class)).isEqualTo(1);
+        assertThat(jdbc.queryForObject("select count(*) from outbox_messages", Long.class)).isEqualTo(1);
     }
 
     @Test
