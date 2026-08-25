@@ -7,12 +7,10 @@ import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
-public interface RetryAttemptRepository extends JpaRepository<RetryAttemptEntity, String> {
-
-    Optional<RetryAttemptEntity> findByTenantIdAndIdempotencyKey(String tenantId, String idempotencyKey);
+public interface IdempotencyRecordRepository extends JpaRepository<IdempotencyRecordEntity, IdempotencyRecordId> {
 
     @Lock(LockModeType.PESSIMISTIC_WRITE)
-    @Query("select a from RetryAttemptEntity a where a.tenantId = :tenantId and a.idempotencyKey = :idempotencyKey")
-    Optional<RetryAttemptEntity> lockByTenantIdAndIdempotencyKey(
+    @Query("select r from IdempotencyRecordEntity r where r.tenantId = :tenantId and r.idempotencyKey = :idempotencyKey")
+    Optional<IdempotencyRecordEntity> lockByTenantIdAndIdempotencyKey(
             @Param("tenantId") String tenantId, @Param("idempotencyKey") String idempotencyKey);
 }
