@@ -5,6 +5,10 @@ export class ApiError extends Error {
     this.status = status
     this.code = code
   }
+
+  get isConflict() {
+    return this.status === 409
+  }
 }
 
 function normalizeTask(task) {
@@ -15,28 +19,27 @@ function normalizeTask(task) {
     state: task.state ?? task.status,
     version: Number(task.version ?? 0),
     attemptCount: Number(task.attemptCount ?? 0),
-    ...(task.lastError ? { lastError: task.lastError } : {}),
-    ...(task.attemptId ? { attemptId: task.attemptId } : {}),
-    ...(typeof task.replayed === 'boolean' ? { replayed: task.replayed } : {})
+    ...(task.lastError ? { lastError: task.lastError } : {})
   }
 }
 
-export function createIdempotencyKey() {
-  if (globalThis.crypto?.randomUUID) {
-    return globalThis.crypto.randomUUID()
+async function readJson(response) {
+  try {
+    return await response.json()
+  } catch {
+    return {}
   }
-  return `key-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
 }
 
-export function mergeTasksPreferringNewer(current, incoming) {
-  const currentById = new Map(current.map((task) => [task.taskId, task]))
-  return incoming.map((task) => {
-    const existing = currentById.get(task.taskId)
-    if (existing && existing.version > task.version) {
-      return existing
-    }
-    return task
-  })
+/**
+ * One logical retry action gets exactly one key. The server contract is
+ * `[A-Za-z0-9][A-Za-z0-9._:-]{7,119}`, so the prefix keeps the first character
+ * alphanumeric and a UUID supplies the rest.
+ */
+export function newIdempotencyKey() {
+  const random = globalThis.crypto?.randomUUID?.()
+    ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 14)}`
+  return `retry-${random}`
 }
 
 export async function fetchTasks(authToken) {
@@ -56,26 +59,41 @@ export async function fetchTasks(authToken) {
   return Array.isArray(payload.tasks) ? payload.tasks.map(normalizeTask) : []
 }
 
-export async function requestRetry({ authToken, task, idempotencyKey }) {
-  const response = await fetch(`/api/workflows/${task.workflowId}/tasks/${task.taskId}/retry`, {
+/**
+ * Posts the published retry contract. The bearer token alone identifies the
+ * tenant; no tenant identifier is ever sent in the URL, body, or a header.
+ */
+export async function requestRetry({ authToken, task, idempotencyKey = newIdempotencyKey() }) {
+  const path = `/api/workflows/${encodeURIComponent(task.workflowId)}`
+    + `/tasks/${encodeURIComponent(task.taskId)}/retry`
+
+  const response = await fetch(path, {
     method: 'POST',
     headers: {
       Accept: 'application/json',
-      Authorization: `Bearer ${authToken}`,
       'Content-Type': 'application/json',
+      Authorization: `Bearer ${authToken}`,
       'Idempotency-Key': idempotencyKey
     },
     body: JSON.stringify({ expectedVersion: task.version })
   })
-  const payload = await response.json().catch(() => ({}))
+  const payload = await readJson(response)
 
   if (!response.ok) {
-    throw new ApiError(
-      payload.message ?? 'The retry could not be queued.',
-      response.status,
-      payload.code
-    )
+    throw new ApiError(payload.message ?? 'The retry could not be queued.', response.status, payload.code)
   }
 
-  return normalizeTask(payload)
+  return {
+    idempotencyKey,
+    attemptId: payload.attemptId,
+    replayed: Boolean(payload.replayed),
+    // Only server-authoritative fields; the caller merges them over its own copy.
+    task: {
+      taskId: payload.id,
+      workflowId: payload.workflowId,
+      name: payload.title,
+      state: payload.status,
+      version: Number(payload.version)
+    }
+  }
 }

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { fetchTasks, mergeTasksPreferringNewer, createIdempotencyKey, requestRetry, ApiError } from './api.js'
+import { fetchTasks, requestRetry } from './api.js'
 import './styles.css'
 
 const RETRYABLE_STATE = 'FAILED_RETRYABLE'
@@ -14,6 +14,17 @@ function humanize(value) {
     .split('_')
     .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
     .join(' ')
+}
+
+/**
+ * Version-guarded merge. A response that carries an older task version than the
+ * copy already on screen is discarded, so a slow task-list response cannot
+ * overwrite the newer state a retry response already applied.
+ */
+function mergeTask(existing, incoming) {
+  if (!existing) return incoming
+  if (existing.version > incoming.version) return existing
+  return { ...existing, ...incoming }
 }
 
 function StateBadge({ state }) {
@@ -77,7 +88,37 @@ function ErrorNotice({ error, onRetry }) {
   )
 }
 
-function TaskDetail({ task, pending, onRetry }) {
+function ConflictNotice({ conflict, onRefresh }) {
+  return (
+    <div className="notice notice--conflict" role="alert">
+      <div>
+        <strong>This task changed somewhere else</strong>
+        <p>{conflict.message}</p>
+      </div>
+      <button type="button" className="button button--secondary" onClick={onRefresh}>
+        Refresh tasks
+      </button>
+    </div>
+  )
+}
+
+function SuccessNotice({ success }) {
+  return (
+    <div className="notice notice--success" role="status">
+      <div>
+        <strong>{success.replayed ? 'Retry already queued' : 'Retry queued'}</strong>
+        <p>
+          {success.replayed
+            ? 'The server replayed the original accepted attempt; no duplicate work was created.'
+            : 'The task moved to Retry queued.'}
+          {' '}Attempt {success.attemptId}.
+        </p>
+      </div>
+    </div>
+  )
+}
+
+function TaskDetail({ task, onRetry, pending }) {
   if (!task) {
     return (
       <section className="detail-panel detail-panel--empty" aria-label="Task details">
@@ -124,16 +165,20 @@ function TaskDetail({ task, pending, onRetry }) {
 
       <div className="detail-panel__actions">
         {task.state === RETRYABLE_STATE ? (
-          <button
-            type="button"
-            className="button button--primary"
-            aria-label="Retry task"
-            aria-busy={pending}
-            disabled={pending}
-            onClick={() => onRetry(task)}
-          >
-            Retry task
-          </button>
+          <>
+            <button
+              type="button"
+              className="button button--primary"
+              onClick={() => onRetry(task)}
+              disabled={pending}
+              aria-busy={pending}
+            >
+              Retry task
+            </button>
+            {pending ? (
+              <p className="muted" role="status">Queueing retry…</p>
+            ) : null}
+          </>
         ) : (
           <p className="muted">This task is not eligible for retry.</p>
         )}
@@ -148,28 +193,36 @@ export default function App({ authToken = import.meta.env.VITE_DEMO_AUTH_TOKEN ?
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState(null)
   const [retryError, setRetryError] = useState(null)
+  const [retryConflict, setRetryConflict] = useState(null)
   const [retrySuccess, setRetrySuccess] = useState(null)
-  const [pending, setPending] = useState(false)
-  const retryInFlight = useRef(false)
+  const [pendingKey, setPendingKey] = useState(null)
+
+  // Synchronous guard: a second click lands before React has flushed `pendingKey`,
+  // so the ref — not the rendered state — is what actually stops the second request.
+  const inFlightRetries = useRef(new Set())
+  // Monotonic list-request generation; only the newest list request owns `loading`.
+  const listGeneration = useRef(0)
 
   const load = useCallback(async () => {
+    const generation = (listGeneration.current += 1)
     setLoading(true)
     setLoadError(null)
 
     try {
       const loadedTasks = await fetchTasks(authToken)
       setTasks((current) => {
-        const merged = mergeTasksPreferringNewer(current, loadedTasks)
-        setSelectedKey((selected) => {
-          if (merged.some((task) => taskKey(task) === selected)) return selected
-          return merged.length > 0 ? taskKey(merged[0]) : null
-        })
-        return merged
+        const byKey = new Map(current.map((task) => [taskKey(task), task]))
+        return loadedTasks.map((task) => mergeTask(byKey.get(taskKey(task)), task))
+      })
+      setSelectedKey((current) => {
+        if (loadedTasks.some((task) => taskKey(task) === current)) return current
+        return loadedTasks.length > 0 ? taskKey(loadedTasks[0]) : null
       })
     } catch (error) {
+      if (generation !== listGeneration.current) return
       setLoadError(error instanceof Error ? error : new Error('The task list could not be loaded.'))
     } finally {
-      setLoading(false)
+      if (generation === listGeneration.current) setLoading(false)
     }
   }, [authToken])
 
@@ -183,36 +236,34 @@ export default function App({ authToken = import.meta.env.VITE_DEMO_AUTH_TOKEN ?
   )
 
   const retry = useCallback(async (task) => {
-    if (retryInFlight.current) {
-      return
-    }
-    retryInFlight.current = true
-    setPending(true)
+    const key = taskKey(task)
+    if (inFlightRetries.current.has(key)) return
+    inFlightRetries.current.add(key)
+    setPendingKey(key)
     setRetryError(null)
+    setRetryConflict(null)
     setRetrySuccess(null)
 
-    const idempotencyKey = createIdempotencyKey()
-
     try {
-      const updated = await requestRetry({ authToken, task, idempotencyKey })
-      setTasks((current) => current.map((item) => (
-        item.taskId === updated.taskId && item.workflowId === updated.workflowId
-          ? { ...item, ...updated, version: Math.max(item.version, updated.version) }
-          : item
-      )))
-      setRetrySuccess(updated.replayed ? 'Retry already queued for this request.' : 'Retry queued.')
+      // One click, one key: generated here and never reused for a later click.
+      const outcome = await requestRetry({ authToken, task })
+      setTasks((current) => current.map(
+        (candidate) => (taskKey(candidate) === key ? mergeTask(candidate, outcome.task) : candidate)
+      ))
+      setRetrySuccess({ replayed: outcome.replayed, attemptId: outcome.attemptId })
     } catch (error) {
-      setRetryError(error instanceof ApiError || error instanceof Error
-        ? error
-        : new Error('The retry could not be queued.'))
+      if (error?.status === 409) {
+        setRetryConflict(error)
+      } else {
+        setRetryError(error instanceof Error ? error : new Error('The retry could not be queued.'))
+      }
     } finally {
-      retryInFlight.current = false
-      setPending(false)
+      inFlightRetries.current.delete(key)
+      setPendingKey((current) => (current === key ? null : current))
     }
   }, [authToken])
 
   const failedCount = tasks.filter((task) => task.state === RETRYABLE_STATE).length
-  const retryNoticeTone = retryError?.status === 409 ? 'notice--error' : 'notice--error'
 
   return (
     <div className="app-shell">
@@ -249,22 +300,9 @@ export default function App({ authToken = import.meta.env.VITE_DEMO_AUTH_TOKEN ?
         </div>
 
         {loadError ? <ErrorNotice error={loadError} onRetry={load} /> : null}
-        {retrySuccess ? (
-          <div className="notice notice--success" role="status">
-            <div>
-              <strong>Retry accepted</strong>
-              <p>{retrySuccess}</p>
-            </div>
-          </div>
-        ) : null}
-        {retryError ? (
-          <div className={`notice ${retryNoticeTone}`} role="alert">
-            <div>
-              <strong>{retryError.status === 409 ? 'Retry could not be queued' : 'Something needs attention'}</strong>
-              <p>{retryError.message}</p>
-            </div>
-          </div>
-        ) : null}
+        {retryConflict ? <ConflictNotice conflict={retryConflict} onRefresh={load} /> : null}
+        {retryError ? <ErrorNotice error={retryError} /> : null}
+        {retrySuccess ? <SuccessNotice success={retrySuccess} /> : null}
 
         {loading && tasks.length === 0 ? (
           <div className="loading-state" role="status">
@@ -283,7 +321,11 @@ export default function App({ authToken = import.meta.env.VITE_DEMO_AUTH_TOKEN ?
               </div>
               <TaskList tasks={tasks} selectedKey={selectedKey} onSelect={setSelectedKey} />
             </section>
-            <TaskDetail task={selectedTask} pending={pending} onRetry={retry} />
+            <TaskDetail
+              task={selectedTask}
+              onRetry={retry}
+              pending={selectedTask ? pendingKey === taskKey(selectedTask) : false}
+            />
           </div>
         )}
       </main>

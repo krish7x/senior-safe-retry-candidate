@@ -235,6 +235,12 @@ main {
   border: 1px solid #b6decf;
 }
 
+.notice--conflict {
+  color: #6d4a12;
+  background: #fff6e2;
+  border: 1px solid #ecd39a;
+}
+
 .loading-state {
   display: flex;
   min-height: 300px;
