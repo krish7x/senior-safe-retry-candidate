@@ -1,0 +1,58 @@
+
+=== 1. Accepted retry -> 202 ===
+202 {"id":"task-alpha-retryable","workflowId":"workflow-alpha","title":"Submit invoice to gateway","status":"RETRY_QUEUED","version":1,"attemptId":"c849407e-75e4-41ca-ad5e-968ef17055d7","replayed":false}
+
+=== 2. Exact replay of the same key -> 200, replayed:true, same attemptId ===
+200 {"id":"task-alpha-retryable","workflowId":"workflow-alpha","title":"Submit invoice to gateway","status":"RETRY_QUEUED","version":1,"attemptId":"c849407e-75e4-41ca-ad5e-968ef17055d7","replayed":true}
+
+=== 3. Database counts prove exactly one attempt, audit event, and outbox record ===
+retry_attempts  : 1
+audit_events    : 1
+outbox_messages : 1
+task status/ver : RETRY_QUEUED v1
+event types     : TASK_RETRY_QUEUED / TASK_RETRY_REQUESTED
+
+=== 4. Same key, different fingerprint -> 409 IDEMPOTENCY_KEY_REUSED ===
+409 {"status":409,"code":"IDEMPOTENCY_KEY_REUSED","message":"Idempotency key was already used for a different request"}
+
+=== 5. Same key against a task that does not exist -> still 409, not 404 ===
+409 {"status":409,"code":"IDEMPOTENCY_KEY_REUSED","message":"Idempotency key was already used for a different request"}
+
+=== 6. Stale version -> 409 STALE_TASK_VERSION ===
+409 {"status":409,"code":"STALE_TASK_VERSION","message":"Expected task version 0 but current version is 1"}
+
+=== 7. Non-retryable task -> 409 TASK_NOT_RETRYABLE ===
+409 {"status":409,"code":"TASK_NOT_RETRYABLE","message":"Task in status FAILED_PERMANENT cannot be retried"}
+
+=== 8. Workflow mismatch -> 404 (identical body to a missing task) ===
+404 {"status":404,"code":"TASK_NOT_FOUND","message":"Task was not found"}
+
+=== 9. Cross-tenant non-enumeration: tenant-beta asking for an alpha task -> 404 ===
+404 {"status":404,"code":"TASK_NOT_FOUND","message":"Task was not found"}
+
+=== 10. Missing authentication -> 401 ===
+401 {"status":401,"code":"UNAUTHORIZED","message":"A valid bearer token is required"}
+
+=== 11. Invalid Idempotency-Key -> 400 INVALID_REQUEST ===
+400 {"status":400,"code":"INVALID_REQUEST","message":"Idempotency-Key must be 8 to 120 characters using letters, digits, '.', '_', ':' or '-'"}
+
+=== 12. Concurrent DIFFERENT keys against the same task/version -> one 202 and one 409 ===
+202 {"id":"task-beta-retryable","workflowId":"workflow-beta","title":"Submit regional document","status":"RETRY_QUEUED","version":1,"attemptId":"3c51f692-76e8-4b5c-ab64-31264554fb48","replayed":false}
+409 {"status":409,"code":"STALE_TASK_VERSION","message":"Expected task version 0 but current version is 1"}
+status codes seen: 1 attempt(s) recorded for tenant-beta
+
+=== 13. Test-fixture reset of the beta task, then concurrent SAME key -> one 202 and one 200 ===
+202 {"id":"task-beta-retryable","workflowId":"workflow-beta","title":"Submit regional document","status":"RETRY_QUEUED","version":1,"attemptId":"7a4a6b6d-f2e9-41b4-ae4e-7186f94cabaa","replayed":false}
+200 {"id":"task-beta-retryable","workflowId":"workflow-beta","title":"Submit regional document","status":"RETRY_QUEUED","version":1,"attemptId":"7a4a6b6d-f2e9-41b4-ae4e-7186f94cabaa","replayed":true}
+
+=== 14. Rollback evidence is covered by the published failure hook in the test suite ===
+RetryFailureInjector cannot be triggered over HTTP by design; see
+  PublicContractTest#failureAfterOutboxInsertionRollsBackTheEntireChangeSet and
+  RetryErrorContractTest#aRolledBackTransactionLeavesNoIdempotencyResultAndTheKeyStaysUsable
+
+=== 15. Final counts across both tenants ===
+retry_attempts  : 2
+audit_events    : 2
+outbox_messages : 2
+attempts/tenant : tenant-alpha=1, tenant-beta=1
+task states     : task-alpha-permanent=FAILED_PERMANENT v0, task-alpha-retryable=RETRY_QUEUED v1, task-alpha-success=SUCCEEDED v2, task-beta-retryable=RETRY_QUEUED v1
