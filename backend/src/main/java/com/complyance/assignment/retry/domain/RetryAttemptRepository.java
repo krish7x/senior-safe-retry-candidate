@@ -1,18 +1,9 @@
 package com.complyance.assignment.retry.domain;
 
-import jakarta.persistence.LockModeType;
 import java.util.Optional;
 import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.data.jpa.repository.Lock;
-import org.springframework.data.jpa.repository.Query;
-import org.springframework.data.repository.query.Param;
 
 public interface RetryAttemptRepository extends JpaRepository<RetryAttemptEntity, String> {
 
     Optional<RetryAttemptEntity> findByTenantIdAndIdempotencyKey(String tenantId, String idempotencyKey);
-
-    @Lock(LockModeType.PESSIMISTIC_WRITE)
-    @Query("select a from RetryAttemptEntity a where a.tenantId = :tenantId and a.idempotencyKey = :idempotencyKey")
-    Optional<RetryAttemptEntity> lockByTenantIdAndIdempotencyKey(
-            @Param("tenantId") String tenantId, @Param("idempotencyKey") String idempotencyKey);
 }

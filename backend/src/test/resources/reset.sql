@@ -1,7 +1,6 @@
 delete from outbox_messages;
 delete from audit_events;
 delete from retry_attempts;
-delete from idempotency_records;
 delete from tasks;
 
 insert into tasks (id, workflow_id, tenant_id, title, status, version, created_at, updated_at)
