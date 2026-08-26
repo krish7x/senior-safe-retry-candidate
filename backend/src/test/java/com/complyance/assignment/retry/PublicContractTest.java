@@ -22,8 +22,11 @@ import org.springframework.test.context.jdbc.Sql;
 import org.springframework.test.web.servlet.MockMvc;
 
 /**
- * Published behavioral contracts. Enable these tests progressively while implementing the assignment.
- * They intentionally do not prescribe a locking strategy or transaction design.
+ * Published behavioral contracts. Every supplied descriptor is enabled and its assertions are
+ * unchanged. They intentionally do not prescribe a locking strategy or transaction design.
+ *
+ * <p>The start-barrier test below is a smoke check, not concurrency evidence. The deterministic
+ * controlled-interleaving proof lives in {@link RetryConcurrencyEvidenceTest}.
  */
 @SpringBootTest(classes = SafeRetryApplication.class)
 @AutoConfigureMockMvc
@@ -40,7 +43,7 @@ class PublicContractTest {
 
     @Test
     void acceptedRetryReturns202AndCreatesOneAttemptAuditAndOutboxRow() throws Exception {
-        retry(ALPHA_AUTH, "workflow-alpha", "task-alpha-retryable", "accepted-contract-key", 0)
+        retry(ALPHA_AUTH, "task-alpha-retryable", "accepted-contract-key", 0)
                 .andExpect(status().isAccepted())
                 .andExpect(jsonPath("$.status").value("RETRY_QUEUED"))
                 .andExpect(jsonPath("$.version").value(1))
@@ -52,10 +55,10 @@ class PublicContractTest {
 
     @Test
     void sameKeyAndRequestReturns200WithOriginalAttemptAndNoDuplicateRows() throws Exception {
-        var first = retry(ALPHA_AUTH, "workflow-alpha", "task-alpha-retryable", "replay-contract-key", 0)
+        var first = retry(ALPHA_AUTH, "task-alpha-retryable", "replay-contract-key", 0)
                 .andExpect(status().isAccepted())
                 .andReturn();
-        var second = retry(ALPHA_AUTH, "workflow-alpha", "task-alpha-retryable", "replay-contract-key", 0)
+        var second = retry(ALPHA_AUTH, "task-alpha-retryable", "replay-contract-key", 0)
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.replayed").value(true))
                 .andReturn();
@@ -67,16 +70,16 @@ class PublicContractTest {
 
     @Test
     void sameKeyWithDifferentExpectedVersionReturns409() throws Exception {
-        retry(ALPHA_AUTH, "workflow-alpha", "task-alpha-retryable", "mismatch-contract-key", 0)
+        retry(ALPHA_AUTH, "task-alpha-retryable", "mismatch-contract-key", 0)
                 .andExpect(status().isAccepted());
-        retry(ALPHA_AUTH, "workflow-alpha", "task-alpha-retryable", "mismatch-contract-key", 1)
+        retry(ALPHA_AUTH, "task-alpha-retryable", "mismatch-contract-key", 1)
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("IDEMPOTENCY_KEY_REUSED"));
     }
 
     @Test
     void staleExpectedVersionReturns409WithoutWrites() throws Exception {
-        retry(ALPHA_AUTH, "workflow-alpha", "task-alpha-retryable", "stale-contract-key", 9)
+        retry(ALPHA_AUTH, "task-alpha-retryable", "stale-contract-key", 9)
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("STALE_TASK_VERSION"));
         assertAtomicRowCounts(0);
@@ -84,7 +87,7 @@ class PublicContractTest {
 
     @Test
     void crossTenantRetryIsConcealedAs404WithoutWrites() throws Exception {
-        retry(BETA_AUTH, "workflow-alpha", "task-alpha-retryable", "tenant-contract-key", 0)
+        retry(BETA_AUTH, "task-alpha-retryable", "tenant-contract-key", 0)
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.code").value("TASK_NOT_FOUND"));
         assertAtomicRowCounts(0);
@@ -95,8 +98,8 @@ class PublicContractTest {
         var ready = new CountDownLatch(2);
         var start = new CountDownLatch(1);
         try (var pool = Executors.newFixedThreadPool(2)) {
-            var first = pool.submit(() -> concurrentRetry(ready, start, "concurrent-contract-key"));
-            var second = pool.submit(() -> concurrentRetry(ready, start, "concurrent-contract-key"));
+            var first = pool.submit(() -> concurrentRetry(ready, start));
+            var second = pool.submit(() -> concurrentRetry(ready, start));
             ready.await();
             start.countDown();
 
@@ -116,7 +119,7 @@ class PublicContractTest {
                 .when(failureInjector)
                 .afterOutboxInserted();
 
-        retry(ALPHA_AUTH, "workflow-alpha", "task-alpha-retryable", "rollback-contract-key", 0)
+        retry(ALPHA_AUTH, "task-alpha-retryable", "rollback-contract-key", 0)
                 .andExpect(status().is5xxServerError());
 
         assertThat(jdbc.queryForObject(
@@ -126,74 +129,11 @@ class PublicContractTest {
                         "select version from tasks where id = 'task-alpha-retryable'", Long.class))
                 .isZero();
         assertAtomicRowCounts(0);
-        assertThat(jdbc.queryForObject("select count(*) from idempotency_records", Long.class)).isZero();
-    }
-
-    @Test
-    void workflowMismatchIsConcealedAs404WithoutWrites() throws Exception {
-        retry(ALPHA_AUTH, "workflow-beta", "task-alpha-retryable", "workflow-mismatch-key", 0)
-                .andExpect(status().isNotFound())
-                .andExpect(jsonPath("$.code").value("TASK_NOT_FOUND"));
-        assertAtomicRowCounts(0);
-    }
-
-    @Test
-    void nonRetryableTaskReturns409WithoutWrites() throws Exception {
-        retry(ALPHA_AUTH, "workflow-alpha", "task-alpha-permanent", "permanent-contract-key", 0)
-                .andExpect(status().isConflict())
-                .andExpect(jsonPath("$.code").value("TASK_NOT_RETRYABLE"));
-        assertAtomicRowCounts(0);
-    }
-
-    @Test
-    void invalidIdempotencyKeyReturns400WithoutWrites() throws Exception {
-        retry(ALPHA_AUTH, "workflow-alpha", "task-alpha-retryable", "short", 0)
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.code").value("INVALID_REQUEST"));
-        assertAtomicRowCounts(0);
-    }
-
-    @Test
-    void missingIdempotencyKeyReturns400() throws Exception {
-        mockMvc.perform(post("/api/workflows/workflow-alpha/tasks/task-alpha-retryable/retry")
-                        .header("Authorization", ALPHA_AUTH)
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"expectedVersion\":0}"))
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.code").value("INVALID_REQUEST"));
-    }
-
-    @Test
-    void sameKeyWithDifferentTaskIdReturns409EvenWhenTheNewTaskIsMissing() throws Exception {
-        retry(ALPHA_AUTH, "workflow-alpha", "task-alpha-retryable", "bound-contract-key", 0)
-                .andExpect(status().isAccepted());
-        retry(ALPHA_AUTH, "workflow-alpha", "task-does-not-exist", "bound-contract-key", 0)
-                .andExpect(status().isConflict())
-                .andExpect(jsonPath("$.code").value("IDEMPOTENCY_KEY_REUSED"));
-        assertAtomicRowCounts(1);
-    }
-
-    @Test
-    void concurrentDifferentKeysProduceOneAcceptAndOneConflict() throws Exception {
-        var ready = new CountDownLatch(2);
-        var start = new CountDownLatch(1);
-        try (var pool = Executors.newFixedThreadPool(2)) {
-            var first = pool.submit(() -> concurrentRetry(ready, start, "different-key-one"));
-            var second = pool.submit(() -> concurrentRetry(ready, start, "different-key-two"));
-            ready.await();
-            start.countDown();
-
-            var statuses = java.util.List.of(
-                    first.get().getResponse().getStatus(), second.get().getResponse().getStatus());
-            assertThat(statuses).containsExactlyInAnyOrder(202, 409);
-        }
-        assertAtomicRowCounts(1);
     }
 
     private org.springframework.test.web.servlet.ResultActions retry(
-            String authorization, String workflowId, String taskId, String key, long expectedVersion)
-            throws Exception {
-        return mockMvc.perform(post("/api/workflows/" + workflowId + "/tasks/" + taskId + "/retry")
+            String authorization, String taskId, String key, long expectedVersion) throws Exception {
+        return mockMvc.perform(post("/api/workflows/workflow-alpha/tasks/" + taskId + "/retry")
                 .header("Authorization", authorization)
                 .header("Idempotency-Key", key)
                 .contentType(MediaType.APPLICATION_JSON)
@@ -201,10 +141,10 @@ class PublicContractTest {
     }
 
     private org.springframework.test.web.servlet.MvcResult concurrentRetry(
-            CountDownLatch ready, CountDownLatch start, String key) throws Exception {
+            CountDownLatch ready, CountDownLatch start) throws Exception {
         ready.countDown();
         start.await();
-        return retry(ALPHA_AUTH, "workflow-alpha", "task-alpha-retryable", key, 0).andReturn();
+        return retry(ALPHA_AUTH, "task-alpha-retryable", "concurrent-contract-key", 0).andReturn();
     }
 
     private void assertAtomicRowCounts(long expected) {

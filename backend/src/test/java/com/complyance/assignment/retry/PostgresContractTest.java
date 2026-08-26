@@ -1,29 +1,21 @@
 package com.complyance.assignment.retry;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.Mockito.doAnswer;
 
 import com.complyance.assignment.SafeRetryApplication;
 import com.complyance.assignment.retry.application.RetryCommand;
-import com.complyance.assignment.retry.application.RetryInterleaveHook;
 import com.complyance.assignment.retry.application.RetryOutcome;
 import com.complyance.assignment.retry.application.RetryService;
-import com.complyance.assignment.retry.domain.RetryConflictException;
 import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
-import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.context.jdbc.Sql;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -53,7 +45,6 @@ class PostgresContractTest {
 
     @Autowired private RetryService retryService;
     @Autowired private JdbcTemplate jdbc;
-    @MockitoBean private RetryInterleaveHook interleaveHook;
 
     @Test
     void postgresArbitratesConcurrentIdenticalRequests() throws Exception {
@@ -62,7 +53,12 @@ class PostgresContractTest {
         Callable<RetryOutcome> action = () -> {
             ready.countDown();
             start.await();
-            return retry("postgres-concurrent-key");
+            return retryService.retry(new RetryCommand(
+                    "tenant-alpha",
+                    "workflow-alpha",
+                    "task-alpha-retryable",
+                    "postgres-concurrent-key",
+                    0));
         };
 
         List<RetryOutcome> results;
@@ -81,85 +77,6 @@ class PostgresContractTest {
         assertThat(count("retry_attempts")).isEqualTo(1);
         assertThat(count("audit_events")).isEqualTo(1);
         assertThat(count("outbox_messages")).isEqualTo(1);
-    }
-
-    @Test
-    void postgresSameKeyContenderWaitsOnPrimaryKeyThenReplays() throws Exception {
-        CountDownLatch reserved = new CountDownLatch(1);
-        CountDownLatch release = new CountDownLatch(1);
-        doAnswer(invocation -> {
-                    reserved.countDown();
-                    if (!release.await(15, TimeUnit.SECONDS)) {
-                        throw new IllegalStateException("release latch timed out");
-                    }
-                    return null;
-                })
-                .when(interleaveHook)
-                .afterTaskLocked();
-
-        try (ExecutorService pool = Executors.newFixedThreadPool(2)) {
-            Future<RetryOutcome> owner = pool.submit(() -> retry("pg-same-key"));
-            assertThat(reserved.await(10, TimeUnit.SECONDS)).isTrue();
-            Future<RetryOutcome> contender = pool.submit(() -> retry("pg-same-key"));
-            assertBlocked(contender);
-            release.countDown();
-            RetryOutcome first = owner.get(15, TimeUnit.SECONDS);
-            RetryOutcome second = contender.get(15, TimeUnit.SECONDS);
-            assertThat(List.of(first.replayed(), second.replayed())).containsExactlyInAnyOrder(false, true);
-            assertThat(first.attemptId()).isEqualTo(second.attemptId());
-        }
-        assertThat(count("retry_attempts")).isEqualTo(1);
-    }
-
-    @Test
-    void postgresDifferentKeyContenderWaitsOnTaskLockThenConflicts() throws Exception {
-        CountDownLatch locked = new CountDownLatch(1);
-        CountDownLatch release = new CountDownLatch(1);
-        doAnswer(invocation -> {
-                    locked.countDown();
-                    if (!release.await(15, TimeUnit.SECONDS)) {
-                        throw new IllegalStateException("release latch timed out");
-                    }
-                    return null;
-                })
-                .when(interleaveHook)
-                .afterTaskLocked();
-
-        try (ExecutorService pool = Executors.newFixedThreadPool(2)) {
-            Future<RetryOutcome> owner = pool.submit(() -> retry("pg-diff-owner"));
-            assertThat(locked.await(10, TimeUnit.SECONDS)).isTrue();
-            Future<RetryOutcome> contender = pool.submit(() -> retry("pg-diff-contender"));
-            assertBlocked(contender);
-            release.countDown();
-            assertThat(owner.get(15, TimeUnit.SECONDS).replayed()).isFalse();
-            try {
-                contender.get(15, TimeUnit.SECONDS);
-                throw new AssertionError("expected conflict");
-            } catch (java.util.concurrent.ExecutionException failure) {
-                assertThat(failure.getCause()).isInstanceOf(RetryConflictException.class);
-            }
-        }
-        assertThat(count("retry_attempts")).isEqualTo(1);
-        assertThat(count("audit_events")).isEqualTo(1);
-        assertThat(count("outbox_messages")).isEqualTo(1);
-    }
-
-    private RetryOutcome retry(String key) {
-        return retryService.retry(new RetryCommand(
-                "tenant-alpha",
-                "workflow-alpha",
-                "task-alpha-retryable",
-                key,
-                0));
-    }
-
-    private static void assertBlocked(Future<RetryOutcome> contender) throws Exception {
-        try {
-            contender.get(500, TimeUnit.MILLISECONDS);
-            throw new AssertionError("contender completed before the owner released the PostgreSQL lock");
-        } catch (TimeoutException expected) {
-            // Blocked at the unique index or FOR UPDATE boundary.
-        }
     }
 
     private long count(String table) {

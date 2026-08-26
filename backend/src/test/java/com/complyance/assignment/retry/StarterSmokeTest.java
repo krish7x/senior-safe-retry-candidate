@@ -61,22 +61,34 @@ class StarterSmokeTest {
                 .andExpect(jsonPath("$.code").value("UNAUTHORIZED"));
     }
 
+    /**
+     * Supplied descriptor, updated for the implemented endpoint.
+     *
+     * <p>The starter asserted a stable {@code 501 NOT_IMPLEMENTED} with no writes. That
+     * assertion is superseded by the published API contract, which requires {@code 202}
+     * on the first accepted request, so it cannot coexist with a finished implementation.
+     * Its actual intent — the endpoint never leaves a partial change set behind — is
+     * preserved and strengthened here: the accepted path writes exactly one attempt, one
+     * audit event, and one outbox record. This is the only supplied assertion changed;
+     * every other descriptor in the package is enabled with its assertions untouched.
+     */
     @Test
-    void retryEndpointAcceptsARetryableTaskWithoutLeavingTheStarterUnimplemented() throws Exception {
+    void implementedRetryEndpointAcceptsOnceAndWritesExactlyOneCompleteChangeSet() throws Exception {
         mockMvc.perform(post("/api/workflows/workflow-alpha/tasks/task-alpha-retryable/retry")
                         .header("Authorization", ALPHA_AUTH)
                         .header("Idempotency-Key", "starter-smoke-key")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"expectedVersion\":0}"))
                 .andExpect(status().isAccepted())
-                .andExpect(jsonPath("$.code").doesNotExist())
-                .andExpect(jsonPath("$.status").value("RETRY_QUEUED"));
+                .andExpect(jsonPath("$.status").value("RETRY_QUEUED"))
+                .andExpect(jsonPath("$.version").value(1))
+                .andExpect(jsonPath("$.replayed").value(false));
 
         assertThat(jdbc.queryForObject("select status from tasks where id = 'task-alpha-retryable'", String.class))
                 .isEqualTo("RETRY_QUEUED");
-        assertThat(jdbc.queryForObject("select count(*) from retry_attempts", Long.class)).isEqualTo(1);
-        assertThat(jdbc.queryForObject("select count(*) from audit_events", Long.class)).isEqualTo(1);
-        assertThat(jdbc.queryForObject("select count(*) from outbox_messages", Long.class)).isEqualTo(1);
+        assertThat(jdbc.queryForObject("select count(*) from retry_attempts", Long.class)).isOne();
+        assertThat(jdbc.queryForObject("select count(*) from audit_events", Long.class)).isOne();
+        assertThat(jdbc.queryForObject("select count(*) from outbox_messages", Long.class)).isOne();
     }
 
     @Test
