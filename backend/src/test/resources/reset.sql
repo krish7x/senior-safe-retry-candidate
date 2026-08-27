@@ -3,6 +3,11 @@ delete from audit_events;
 delete from retry_attempts;
 delete from tasks;
 
+delete from tenant_retry_pause;
+insert into tenant_retry_pause (tenant_id, paused) values
+    ('tenant-alpha', false),
+    ('tenant-beta', false);
+
 insert into tasks (id, workflow_id, tenant_id, title, status, version, created_at, updated_at)
 values
     ('task-alpha-retryable', 'workflow-alpha', 'tenant-alpha', 'Submit invoice to gateway', 'FAILED_RETRYABLE', 0, current_timestamp, current_timestamp),

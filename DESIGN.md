@@ -146,7 +146,73 @@ Java 21.0.12.1, Maven 3.9.16, Node 22.15.0, Docker 29.7.2. Results quoted as pro
   (`Tests run: 2, Failures: 2`); removing the `mergeTask` version guard fails exactly the
   stale-list test (`Tests 1 failed | 15 passed`). Both mutations were reverted.
 - **Added dependencies:** `None`.
-- **Incomplete or unverified:** the standardized 2:50 change request is not included (see
-  `SESSION_LOG.md`). Nothing consumes `outbox_messages` — out of scope by design. No load
-  testing was run, so the row-lock strategy is proven correct but not characterised under
-  sustained contention.
+- **Incomplete or unverified:** Nothing consumes `outbox_messages` — out of scope by design.
+  No load testing was run, so the row-lock strategy is proven correct but not characterised
+  under sustained contention. The 2:50 change request is implemented and recorded in §7.
+
+## 7. Change request — Emergency tenant retry pause
+
+The standardized change request (`issue #1`, base commit `bfc2082`) adds an operations
+control that immediately stops all new retries for one tenant.
+
+### 7.1 What changed
+
+- **`PUT /api/retries/pause`** (`RetryPauseController`) — tenant derived from the bearer token
+  only; nothing in the body or path is trusted. Returns `204`; calling it again also returns
+  `204` (idempotent). No request body.
+- **`V4__tenant_retry_pause.sql`** — a new `tenant_retry_pause(tenant_id PK, paused,
+  paused_at)` table, additive and column-safe for V1/V2 and the reserved V100. One gate row is
+  provisioned per supplied tenant. The pause is a **database row**, so it survives an
+  application restart and arbitrates across every application instance, not just one JVM.
+- **`RetryPauseService.pause`** — takes an **exclusive** lock on the tenant's gate row and sets
+  `paused = true`.
+- **`RetryTransaction.accept`** — after the two idempotency-replay checks and the task row lock,
+  and **before any write**, it reads the gate under a **shared** lock. If paused it throws
+  `TenantRetriesPausedException` → `409 TENANT_RETRIES_PAUSED`, so a rejected retry changes no
+  task and creates no attempt, audit, outbox, or idempotency record. The replay checks run
+  first, so **exact replays of retries accepted before the pause still return their original
+  result** even while paused.
+
+### 7.2 How the pause/retry race is arbitrated (the hard requirement)
+
+The gate row is used as a **reader/writer lock**: a retry reads it `for share`
+(`PESSIMISTIC_READ`), a pause takes it `for update` (`PESSIMISTIC_WRITE`).
+
+- Retries do **not** serialise against each other (shared locks are mutually compatible), so
+  the common path keeps its concurrency.
+- A pause and a retry **are** mutually exclusive on the gate. Two orderings, both correct:
+  - **Retry holds the shared lock first** → the pause's exclusive lock waits until that retry
+    commits. The retry commits first (sees "not paused"), *then* the pause returns.
+  - **Pause holds the exclusive lock first** → the retry's shared lock waits until the pause
+    commits, then reads `paused = true` and loses with `409`, writing nothing.
+- Because a retry that read "not paused" holds the shared lock until it commits, **once the
+  pause has returned `204` no such retry can still be in flight** — so none can commit
+  afterwards. This is enforced by PostgreSQL row locks, so it holds across instances.
+
+Deadlock-free: a pause only ever locks the gate row; a retry locks the task row then the gate
+row, and never the reverse, so there is no lock-order cycle.
+
+### 7.3 Risks and trade-offs
+
+- **A gate row must exist to be lockable.** Supplied tenants are seeded in `V4`; a tenant with
+  no seed row would only be safe on first-pause via the primary key. A production system would
+  create the gate row at tenant onboarding. Documented, not a gap for the supplied tenants.
+- **Pause precedence over stale/again-not-retryable.** A new retry on a paused tenant returns
+  `TENANT_RETRIES_PAUSED` even if it would also be stale; the emergency stop is reported first.
+  Replays are unaffected because they resolve before the pause check.
+- **No resume endpoint** — the change request explicitly does not require one; the `paused`
+  column is the natural seam for a later resume.
+
+### 7.4 Tests run (all green)
+
+`cd backend && mvn -B test` → `Tests run: 35, Failures: 0, Errors: 0, Skipped: 0` (up from 27).
+New:
+- **`TenantRetryPauseContractTest`** (6) — auth required; idempotent `204`; paused tenant
+  retry → `409` with zero writes; pause covers any workflow/task of the tenant; pre-pause
+  replay still returns its original result; other tenants keep working.
+- **`TenantPauseConcurrencyEvidenceTest`** (2, real PostgreSQL) — using `pg_blocking_pids()`:
+  a retry arriving during a pause parks on the gate then loses and writes nothing; a pause
+  arriving during an in-flight retry parks until that retry finishes.
+
+No supplied contract assertion was weakened. No new dependency was added. Frontend is
+unchanged (the change request needs no UI), so its suite is not re-run in this window.

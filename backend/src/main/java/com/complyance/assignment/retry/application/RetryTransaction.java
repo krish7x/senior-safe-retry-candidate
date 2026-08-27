@@ -12,6 +12,9 @@ import com.complyance.assignment.retry.domain.TaskEntity;
 import com.complyance.assignment.retry.domain.TaskNotFoundException;
 import com.complyance.assignment.retry.domain.TaskRepository;
 import com.complyance.assignment.retry.domain.TaskStatus;
+import com.complyance.assignment.retry.domain.TenantRetriesPausedException;
+import com.complyance.assignment.retry.domain.TenantRetryPauseEntity;
+import com.complyance.assignment.retry.domain.TenantRetryPauseRepository;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.UUID;
@@ -38,6 +41,7 @@ class RetryTransaction {
     private final RetryAttemptRepository attempts;
     private final AuditEventRepository auditEvents;
     private final OutboxMessageRepository outboxMessages;
+    private final TenantRetryPauseRepository pauses;
     private final RetryFailureInjector failureInjector;
     private final ObjectMapper objectMapper;
 
@@ -46,12 +50,14 @@ class RetryTransaction {
             RetryAttemptRepository attempts,
             AuditEventRepository auditEvents,
             OutboxMessageRepository outboxMessages,
+            TenantRetryPauseRepository pauses,
             RetryFailureInjector failureInjector,
             ObjectMapper objectMapper) {
         this.tasks = tasks;
         this.attempts = attempts;
         this.auditEvents = auditEvents;
         this.outboxMessages = outboxMessages;
+        this.pauses = pauses;
         this.failureInjector = failureInjector;
         this.objectMapper = objectMapper;
     }
@@ -77,6 +83,14 @@ class RetryTransaction {
         var acceptedWhileWaiting = findAttempt(command);
         if (acceptedWhileWaiting != null) {
             return replayOrReject(acceptedWhileWaiting, fingerprint);
+        }
+
+        // 4. Read the tenant pause gate under a shared lock, after the replay checks so a
+        //    pre-pause accepted retry still replays, and before any write so a paused tenant
+        //    changes nothing. Holding the shared lock until commit forces a concurrent pause
+        //    to wait: either this retry commits first, or the pause wins and this loses here.
+        if (isTenantPaused(command.tenantId())) {
+            throw new TenantRetriesPausedException();
         }
 
         if (task.getVersion() != command.expectedVersion()) {
@@ -175,6 +189,12 @@ class RetryTransaction {
         return attempts
                 .findByTenantIdAndIdempotencyKey(command.tenantId(), command.idempotencyKey())
                 .orElse(null);
+    }
+
+    private boolean isTenantPaused(String tenantId) {
+        return pauses.lockSharedForRetry(tenantId)
+                .map(TenantRetryPauseEntity::isPaused)
+                .orElse(false);
     }
 
     /**
